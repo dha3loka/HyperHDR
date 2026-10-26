@@ -94,11 +94,11 @@
     "continuousOutput": false
   },
   "videoGrabber": {
-    "device": "auto",
+    "device": "Android MediaProjection API",
     "input": -1,
-    "videoMode": "auto",
-    "fps": 0,
-    "videoEncoding": "auto",
+    "videoMode": "256x144",
+    "fps": 30,
+    "videoEncoding": "RGBA",
     "qFrame": false,
     "hdrToneMapping": false,
     "cecHdrStart": 0,
@@ -131,7 +131,7 @@
     "led_off_pause": false
   },
   "systemGrabber": {
-    "device": "auto",
+    "device": "Android MediaProjection API",
     "videoMode": 512,
     "fps": 30,
     "hdrToneMapping": false,

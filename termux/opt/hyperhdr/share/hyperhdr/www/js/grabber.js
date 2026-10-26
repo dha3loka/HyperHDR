@@ -649,11 +649,24 @@ $(document).ready( function(){
 		{
 			var systemSaveOptions = conf_system_section_editor.getValue();
 			requestWriteConfig(systemSaveOptions);
+			sendToHyperhdr("mediaprojection", "start");
 		});
 		
 		if (window.serverInfo.systemGrabbers.device.indexOf("DirectX11")<0)
 		{
-			if (window.serverInfo.systemGrabbers.device.indexOf("macOS")>=0)
+			if (window.serverInfo.systemGrabbers.device.indexOf("MediaProjection")>=0)
+			{
+				createHint("intro", "Android MediaProjection API captures the Android / Android TV display in real time via hardware VirtualDisplay + ImageReader. Select 'Android MediaProjection API' below and click 'Start / Grant Android MediaProjection Permission' (or Save) to approve screen capture on your device.", "editor_container_system_device");
+				var mpBtnBar = $('<div class="mt-2 mb-3"><button type="button" id="btn_start_mediaprojection" class="btn btn-success me-2">Start / Grant Android MediaProjection Permission</button><button type="button" id="btn_stop_mediaprojection" class="btn btn-outline-danger">Stop MediaProjection</button></div>');
+				$('#editor_container_system_device').prepend(mpBtnBar);
+				$('#btn_start_mediaprojection').off().on('click', function() {
+					sendToHyperhdr("mediaprojection", "start");
+				});
+				$('#btn_stop_mediaprojection').off().on('click', function() {
+					sendToHyperhdr("mediaprojection", "stop");
+				});
+			}
+			else if (window.serverInfo.systemGrabbers.device.indexOf("macOS")>=0)
 				createHint("intro", $.i18n('conf_grabber_macOs_intro'), "editor_container_system_device");
 			else if (window.serverInfo.systemGrabbers.device.indexOf("X11")>=0)
 				createHint("intro", $.i18n('conf_grabber_x11_intro'), "editor_container_system_device");
@@ -785,6 +798,7 @@ $(document).ready( function(){
 		{
 			var videoSaveOptions = conf_video_section_editor.getValue();
 			requestWriteConfig(videoSaveOptions);
+			sendToHyperhdr("mediaprojection", "start");
 		});
 		
 		//create introduction

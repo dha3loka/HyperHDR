@@ -121,6 +121,8 @@ public class HyperHdrServer {
 
             JSONObject activeCfg = getActiveInstanceConfig();
             if (activeCfg != null) {
+                migrateGrabberConfig(activeCfg);
+                saveDatabase();
                 JSONObject webCfg = activeCfg.optJSONObject("webConfig");
                 if (webCfg != null) {
                     httpPort = webCfg.optInt("port", 8090);
@@ -143,6 +145,59 @@ public class HyperHdrServer {
             appendLog("INFO", "DAEMON", "HyperHDR v24.0.0-beta.0 Server initialized on Android TV (Web port " + httpPort + ", FlatBuffers port " + flatbufPort + ")");
         } catch (Exception e) {
             appendLog("ERROR", "DAEMON", "Initialization error: " + e.getMessage());
+        }
+    }
+
+    private void migrateGrabberConfig(JSONObject cfg) {
+        try {
+            JSONObject sysCtrl = cfg.optJSONObject("systemControl");
+            if (sysCtrl == null) {
+                sysCtrl = new JSONObject();
+                cfg.put("systemControl", sysCtrl);
+            }
+            sysCtrl.put("systemInstanceEnable", true);
+
+            JSONObject vidCtrl = cfg.optJSONObject("videoControl");
+            if (vidCtrl == null) {
+                vidCtrl = new JSONObject();
+                cfg.put("videoControl", vidCtrl);
+            }
+            vidCtrl.put("videoInstanceEnable", true);
+
+            JSONObject sysGrab = cfg.optJSONObject("systemGrabber");
+            if (sysGrab == null) {
+                sysGrab = new JSONObject();
+                cfg.put("systemGrabber", sysGrab);
+            }
+            String sDev = sysGrab.optString("device", "auto");
+            if (sDev.isEmpty() || "auto".equalsIgnoreCase(sDev) || sDev.contains("Pipewire") || sDev.contains("Android TV Display") || sDev.contains("screencap")) {
+                sysGrab.put("device", "Android MediaProjection API");
+            }
+
+            JSONObject vidGrab = cfg.optJSONObject("videoGrabber");
+            if (vidGrab == null) {
+                vidGrab = new JSONObject();
+                cfg.put("videoGrabber", vidGrab);
+            }
+            String vDev = vidGrab.optString("device", "auto");
+            if (vDev.isEmpty() || "auto".equalsIgnoreCase(vDev) || "Android-MediaProjection-0".equals(vDev) || "Termux-ScreenGrabber-0".equals(vDev)) {
+                vidGrab.put("device", "Android MediaProjection API");
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    public void notifyGrabberStateChanged() {
+        try {
+            JSONObject compMsg = new JSONObject();
+            compMsg.put("command", "components-update");
+            JSONObject data = new JSONObject();
+            data.put("name", "SYSTEMGRABBER");
+            data.put("enabled", colorEngine.getComponentState("SYSTEMGRABBER"));
+            compMsg.put("data", data);
+            broadcastWs(compMsg);
+            broadcastPrioritiesUpdate();
+        } catch (Exception ignored) {
         }
     }
 
@@ -202,7 +257,13 @@ public class HyperHdrServer {
         try {
             httpServerSocket = new ServerSocket();
             httpServerSocket.setReuseAddress(true);
-            httpServerSocket.bind(new InetSocketAddress("0.0.0.0", httpPort));
+            try {
+                httpServerSocket.bind(new InetSocketAddress("0.0.0.0", httpPort));
+            } catch (Exception bindEx) {
+                // Fallback to 8091 if Termux daemon is already listening on 8090
+                httpPort = 8091;
+                httpServerSocket.bind(new InetSocketAddress("0.0.0.0", httpPort));
+            }
             appendLog("INFO", "WEBSERVER", "Started HTTP/WebSocket server on 0.0.0.0:" + httpPort);
             while (running) {
                 Socket sock = httpServerSocket.accept();
@@ -421,6 +482,17 @@ public class HyperHdrServer {
 
             if ("/hyperhdr_heart_beat".equals(path)) {
                 writeHttpResponse(os, "200 OK", "text/plain; charset=utf-8", "OK".getBytes(StandardCharsets.UTF_8));
+                sock.close();
+                return;
+            }
+
+            if ("/mediaprojection-frame.rgb".equals(path)) {
+                byte[] pkt = screenCaptureManager.getLatestBridgePacket();
+                if (pkt != null && screenCaptureManager.isMediaProjectionActive()) {
+                    writeHttpResponse(os, "200 OK", "application/octet-stream", pkt);
+                } else {
+                    writeHttpResponse(os, "204 No Content", "text/plain; charset=utf-8", new byte[0]);
+                }
                 sock.close();
                 return;
             }
@@ -688,19 +760,44 @@ public class HyperHdrServer {
                     if (newCfg != null) {
                         JSONObject currentCfg = getActiveInstanceConfig();
                         JSONArray names = newCfg.names();
+                        boolean grabberTouched = false;
                         if (names != null) {
                             for (int i = 0; i < names.length(); i++) {
                                 String k = names.getString(i);
                                 currentCfg.put(k, newCfg.get(k));
+                                if ("systemGrabber".equals(k) || "videoGrabber".equals(k)
+                                        || "systemControl".equals(k) || "videoControl".equals(k)) {
+                                    grabberTouched = true;
+                                }
                             }
                         }
                         saveDatabase();
                         colorEngine.applyConfig(currentCfg);
                         screenCaptureManager.applyConfig(currentCfg);
-                        appendLog("INFO", "CONFIG", "Saved configuration for instance " + currentInstance + " (LED device: " + wledDriver.getDeviceType() + " @ " + wledDriver.getHost() + ")");
+                        appendLog("INFO", "CONFIG", "Saved configuration for instance " + currentInstance + " (Grabber: Android MediaProjection API, LED device: " + wledDriver.getDeviceType() + " @ " + wledDriver.getHost() + ")");
                         broadcastSettingsUpdate(currentCfg);
+                        if (grabberTouched && !screenCaptureManager.isMediaProjectionActive()) {
+                            HyperHdrService svc = HyperHdrService.getInstance();
+                            if (svc != null) {
+                                svc.requestMediaProjectionFromUi(false);
+                            }
+                        }
                     }
                 }
+                break;
+
+            case "mediaprojection":
+                HyperHdrService mpSvc = HyperHdrService.getInstance();
+                if ("stop".equals(sub)) {
+                    screenCaptureManager.stopCapture();
+                    notifyGrabberStateChanged();
+                } else if (mpSvc != null) {
+                    mpSvc.requestMediaProjectionFromUi(req.optBoolean("headless_bridge", false));
+                }
+                JSONObject mpInfo = new JSONObject();
+                mpInfo.put("active", screenCaptureManager.isMediaProjectionActive());
+                mpInfo.put("mode", screenCaptureManager.getActiveCaptureMode());
+                resp.put("info", mpInfo);
                 break;
 
             case "sysinfo":
@@ -726,6 +823,14 @@ public class HyperHdrServer {
                     boolean state = cs.optBoolean("state", true);
                     colorEngine.setComponentState(comp, state);
                     appendLog("INFO", "COMPONENT", "Component " + comp + " set to " + (state ? "ENABLED" : "DISABLED"));
+                    if (state && ("GRABBER".equals(comp) || "SYSTEMGRABBER".equals(comp) || "V4L".equals(comp) || "VIDEOGRABBER".equals(comp))) {
+                        if (!screenCaptureManager.isMediaProjectionActive()) {
+                            HyperHdrService svc = HyperHdrService.getInstance();
+                            if (svc != null) {
+                                svc.requestMediaProjectionFromUi(false);
+                            }
+                        }
+                    }
                     JSONObject compMsg = new JSONObject();
                     compMsg.put("command", "components-update");
                     JSONObject data = new JSONObject();
@@ -1279,27 +1384,29 @@ public class HyperHdrServer {
         // Grabbers
         JSONObject grabbers = new JSONObject();
         JSONArray activeGrabbers = new JSONArray();
-        activeGrabbers.put("Android TV Screen Grabber (" + screenCaptureManager.getActiveCaptureMode() + ")");
-        activeGrabbers.put("V4L2");
+        activeGrabbers.put("Android MediaProjection API (" + screenCaptureManager.getActiveCaptureMode() + ")");
+        activeGrabbers.put("Android MediaProjection API");
         grabbers.put("active", activeGrabbers);
         JSONArray availGrabbers = new JSONArray();
-        availGrabbers.put("Video capturing (V4L2 / Android USB)");
-        availGrabbers.put("System capturing (Android TV MediaProjection / Screencap)");
+        availGrabbers.put("System capturing (Android MediaProjection API)");
+        availGrabbers.put("Video capturing (Android MediaProjection API)");
         grabbers.put("available", availGrabbers);
         grabbers.put("lut_for_hdr_exists", 1);
         grabbers.put("lutFastCRC", "0x240000B0");
 
         JSONObject currentGrabState = new JSONObject();
-        currentGrabState.put("device", screenCaptureManager.isCapturing()
-                ? ("Android TV " + screenCaptureManager.getActiveCaptureMode() + " (Active)")
-                : "Android TV SurfaceFlinger (Ready)");
-        currentGrabState.put("videoMode", "1920x1080 60fps -> 192x108 RGBA");
+        currentGrabState.put("device", screenCaptureManager.isMediaProjectionActive()
+                ? "Android MediaProjection API (Active)"
+                : "Android MediaProjection API (Ready)");
+        currentGrabState.put("videoMode",
+                screenCaptureManager.getCaptureWidth() + "x" + screenCaptureManager.getCaptureHeight()
+                        + " " + screenCaptureManager.getTargetFps() + "fps RGBA (MediaProjection)");
         grabbers.put("current", currentGrabState);
 
         JSONArray videoDevs = new JSONArray();
         JSONObject vdev = new JSONObject();
-        vdev.put("device", "Android-MediaProjection-0");
-        vdev.put("name", "Android TV Internal Screen Grabber (MediaProjection / Screencap)");
+        vdev.put("device", "Android MediaProjection API");
+        vdev.put("name", "Android MediaProjection API (Hardware VirtualDisplay Screen Grabber)");
         JSONObject vctrl = new JSONObject();
         vctrl.put("BrightnessDef", "Brightness: 0");
         vctrl.put("ContrastDef", "Contrast: 0");
@@ -1307,7 +1414,13 @@ public class HyperHdrServer {
         vctrl.put("HueDef", "Hue: 0");
         vdev.put("videoControls", vctrl);
         JSONArray vmodes = new JSONArray();
-        for (int[] res : new int[][]{{1920, 1080, 60}, {1280, 720, 60}, {1920, 1080, 30}, {1280, 720, 30}}) {
+        for (int[] res : new int[][]{
+                {256, 144, 60}, {256, 144, 30}, {256, 144, 25},
+                {320, 180, 60}, {320, 180, 30}, {320, 180, 25},
+                {640, 360, 60}, {640, 360, 30},
+                {1280, 720, 60}, {1280, 720, 30},
+                {1920, 1080, 60}, {1920, 1080, 30}
+        }) {
             JSONObject m = new JSONObject();
             m.put("width", res[0]);
             m.put("height", res[1]);
@@ -1327,13 +1440,14 @@ public class HyperHdrServer {
         info.put("grabbers", grabbers);
         info.put("grabberstate", currentGrabState);
 
-        // System grabbers
+        // System grabbers — expose Android MediaProjection API as primary selectable device & modes
         JSONObject sysGrabbers = new JSONObject();
-        sysGrabbers.put("device", "pipewire / Android TV MediaProjection");
+        sysGrabbers.put("device", "Android MediaProjection API");
         JSONArray sysModes = new JSONArray();
-        sysModes.put("Pipewire All Screens (RemoteDesktop API)");
-        sysModes.put("Pipewire System Dialog selection (ScreenCast API)");
-        sysModes.put("Android TV Display (1920x1080 -> 192x108)");
+        sysModes.put("Android MediaProjection API");
+        sysModes.put("Android MediaProjection API (Low-Latency 256x144)");
+        sysModes.put("Android MediaProjection API (HD 320x180)");
+        sysModes.put("Android MediaProjection API (Full 640x360)");
         sysGrabbers.put("modes", sysModes);
         info.put("systemGrabbers", sysGrabbers);
 

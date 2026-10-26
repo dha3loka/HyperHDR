@@ -10,6 +10,7 @@ public abstract class Context {
     public Resources getResources() { return null; }
     public File getFilesDir() { return null; }
     public Object getSystemService(String name) { return null; }
+    public void startActivity(Intent intent) {}
     public ComponentName startService(Intent service) { return null; }
     public ComponentName startForegroundService(Intent service) { return null; }
 }

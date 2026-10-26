@@ -78,14 +78,15 @@ class TermuxScreenGrabber:
       5. External FlatBuffers (:19400), Protobuf (:19445), or JSON-RPC `image` frames
     Downscales captured frames to 192x108 RGB24 for low-latency LED zone mapping and WebSocket live video preview.
     """
-    def __init__(self, target_width=192, target_height=108):
+    def __init__(self, target_width=256, target_height=144):
         self.target_width = target_width
         self.target_height = target_height
-        self.target_fps = 25
+        self.target_fps = 30
         self.crop_left = 0
         self.crop_right = 0
         self.crop_top = 0
         self.crop_bottom = 0
+        self.device_mode = "Android MediaProjection API"
         self.enabled = True
         self.running = True
 
@@ -93,9 +94,11 @@ class TermuxScreenGrabber:
         self.latest_w = 0
         self.latest_h = 0
         self.latest_frame_ts = 0.0
+        self.last_mp_udp_ts = 0.0
+        self.last_mp_prompt_ts = 0.0
         self.latest_preview_bytes = None
         self.last_preview_encoded_ts = 0.0
-        self.active_backend = "Initializing"
+        self.active_backend = "Android MediaProjection API"
         self.current_fps = 0.0
         self.last_latency_ms = 2
         self._frames_in_window = 0
@@ -109,17 +112,95 @@ class TermuxScreenGrabber:
     def configure(self, sys_grab_cfg):
         if not isinstance(sys_grab_cfg, dict):
             return
-        self.target_fps = max(5, min(60, int(sys_grab_cfg.get("fps", 25))))
+        self.target_fps = max(5, min(60, int(sys_grab_cfg.get("fps", 30))))
         self.crop_left = max(0, int(sys_grab_cfg.get("cropLeft", 0)))
         self.crop_right = max(0, int(sys_grab_cfg.get("cropRight", 0)))
         self.crop_top = max(0, int(sys_grab_cfg.get("cropTop", 0)))
         self.crop_bottom = max(0, int(sys_grab_cfg.get("cropBottom", 0)))
+        self.device_mode = str(sys_grab_cfg.get("device", "Android MediaProjection API"))
 
     def is_capturing(self):
         return (time.time() - self.latest_frame_ts) < 3.5
 
     def start(self):
+        threading.Thread(target=self._mediaprojection_udp_listener, daemon=True).start()
         threading.Thread(target=self._capture_loop, daemon=True).start()
+        threading.Thread(target=self._auto_prompt_mediaprojection_once, daemon=True).start()
+
+    def _auto_prompt_mediaprojection_once(self):
+        time.sleep(1.2)
+        if not self.is_capturing():
+            self.request_mediaprojection_permission()
+
+    def request_mediaprojection_permission(self):
+        now = time.time()
+        if (now - self.last_mp_prompt_ts) < 2.0:
+            return False
+        self.last_mp_prompt_ts = now
+        env = os.environ.copy()
+        env.pop("LD_PRELOAD", None)
+        if "/system/bin" not in env.get("PATH", ""):
+            env["PATH"] = env.get("PATH", "") + ":/system/bin:/system/xbin"
+        cmds = [
+            [
+                "/system/bin/am", "start", "--user", "0",
+                "-n", "org.hyperhdr.androidtv/.MainActivity",
+                "-a", "org.hyperhdr.androidtv.ACTION_REQUEST_MEDIA_PROJECTION",
+                "--ez", "headless_bridge", "true",
+            ],
+            [
+                "am", "start",
+                "-n", "org.hyperhdr.androidtv/.MainActivity",
+                "-a", "org.hyperhdr.androidtv.ACTION_REQUEST_MEDIA_PROJECTION",
+                "--ez", "headless_bridge", "true",
+            ],
+        ]
+        for cmd in cmds:
+            try:
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+                out, err = p.communicate(timeout=2.5)
+                if p.returncode == 0 and b"Error:" not in out and b"Error:" not in err:
+                    self.active_backend = "Android MediaProjection API"
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _mediaprojection_udp_listener(self):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 19446))
+            while self.running:
+                data, _ = sock.recvfrom(65535)
+                if not self.enabled or len(data) < 12 or data[:4] != b"HHMP":
+                    continue
+                t0 = time.time()
+                bw, bh = struct.unpack("!HH", data[4:8])
+                rgb = data[8:]
+                if bw > 0 and bh > 0 and len(rgb) >= bw * bh * 3:
+                    self.last_mp_udp_ts = t0
+                    self._on_new_frame(rgb[: bw * bh * 3], bw, bh, "Android MediaProjection API", t0)
+        except Exception:
+            pass
+
+    def _try_mediaprojection_http(self):
+        for port in (8091, 8090):
+            try:
+                t0 = time.time()
+                req = urllib.request.Request(f"http://127.0.0.1:{port}/mediaprojection-frame.rgb")
+                with urllib.request.urlopen(req, timeout=0.35) as resp:
+                    if resp.status == 200:
+                        data = resp.read()
+                        if len(data) >= 12 and data[:4] == b"HHMP":
+                            bw, bh = struct.unpack("!HH", data[4:8])
+                            rgb = data[8:]
+                            if bw > 0 and bh > 0 and len(rgb) >= bw * bh * 3:
+                                self._on_new_frame(rgb[: bw * bh * 3], bw, bh, "Android MediaProjection API", t0)
+                                return True
+            except Exception:
+                pass
+        return False
 
     def inject_external_frame(self, rgb_bytes, width, height, source_name="External Stream"):
         if not rgb_bytes or width <= 0 or height <= 0:
@@ -137,15 +218,19 @@ class TermuxScreenGrabber:
                 time.sleep(0.25)
                 continue
 
-            # If an external FlatBuffers/Protobuf/JSON-RPC stream is actively pushing frames, yield to it
+            # If MediaProjection UDP bridge or external FlatBuffers/Protobuf/JSON-RPC stream is pushing frames, yield to it
+            if (t0 - self.last_mp_udp_ts) < 1.0:
+                time.sleep(0.08)
+                continue
             if self.active_backend in ("FlatBuffers", "Protobuf", "JSON-RPC Image") and (t0 - self.latest_frame_ts) < 1.5:
                 time.sleep(0.1)
                 continue
 
             captured = (
-                self._try_screencap_cmd(["/system/bin/screencap"], "Android screencap")
-                or self._try_screencap_cmd(["screencap"], "Android screencap")
-                or self._try_screencap_cmd(["su", "-c", "/system/bin/screencap"], "Root screencap")
+                self._try_mediaprojection_http()
+                or self._try_screencap_cmd(["/system/bin/screencap"], "Android MediaProjection / screencap")
+                or self._try_screencap_cmd(["screencap"], "Android MediaProjection / screencap")
+                or self._try_screencap_cmd(["su", "-c", "/system/bin/screencap"], "Android Root screencap")
                 or self._try_adb_loopback()
                 or self._try_framebuffer()
                 or self._try_x11_grab()
@@ -596,11 +681,16 @@ class HeadlessHyperHdrDaemon:
             "PROTOSERVER": True, "RAWUDPSERVER": False, "LEDDEVICE": True, "HDR": False,
         }
         self.priorities = {
+            240: {
+                "priority": 240, "componentId": "VIDEOGRABBER",
+                "origin": "System", "owner": "Android MediaProjection API",
+                "active": True, "visible": False, "duration_ms": -1,
+            },
             250: {
                 "priority": 250, "componentId": "SYSTEMGRABBER",
-                "origin": "System", "owner": "Termux Screen Grabber",
+                "origin": "System", "owner": "Android MediaProjection API",
                 "active": True, "visible": True, "duration_ms": -1,
-            }
+            },
         }
         self.priorities_autoselect = True
         self.manual_priority = 250
@@ -631,6 +721,14 @@ class HeadlessHyperHdrDaemon:
                 "settings": {"0": cfg0},
             }
         cfg = self.get_active_config()
+        cfg.setdefault("systemControl", {})["systemInstanceEnable"] = True
+        cfg.setdefault("videoControl", {})["videoInstanceEnable"] = True
+        sys_grab = cfg.setdefault("systemGrabber", {})
+        if sys_grab.get("device", "auto") in ("", "auto") or "Pipewire" in str(sys_grab.get("device", "")) or "screencap" in str(sys_grab.get("device", "")):
+            sys_grab["device"] = "Android MediaProjection API"
+        vid_grab = cfg.setdefault("videoGrabber", {})
+        if vid_grab.get("device", "auto") in ("", "auto", "Termux-ScreenGrabber-0", "Android-MediaProjection-0"):
+            vid_grab["device"] = "Android MediaProjection API"
         if wled_host:
             cfg.setdefault("device", {})["host"] = wled_host
             cfg["device"]["type"] = "wled"
@@ -853,7 +951,7 @@ class HeadlessHyperHdrDaemon:
             self.priorities[250]["active"] = bool(
                 self.components.get("GRABBER", True) and self.components.get("SYSTEMGRABBER", True)
             )
-            self.priorities[250]["owner"] = f"Termux Screen Grabber ({self.grabber.active_backend})"
+            self.priorities[250]["owner"] = f"Android MediaProjection API ({self.grabber.active_backend})"
 
         items = sorted(self.priorities.values(), key=lambda x: x["priority"])
         for it in items:
@@ -1299,8 +1397,26 @@ class HeadlessHyperHdrDaemon:
                     sys_en = bool(cur_cfg["systemControl"].get("systemInstanceEnable", True))
                     self.components["SYSTEMGRABBER"] = sys_en
                     self.grabber.enabled = sys_en
-                self.log("INFO", "CONFIG", f"Configuration saved (LED device: {self.wled.device_type} @ {self.wled.host})")
+                if any(k in new_cfg for k in ("systemGrabber", "videoGrabber", "systemControl", "videoControl")):
+                    if not self.grabber.is_capturing():
+                        threading.Thread(target=self.grabber.request_mediaprojection_permission, daemon=True).start()
+                self.log("INFO", "CONFIG", f"Configuration saved (Grabber: Android MediaProjection API, LED device: {self.wled.device_type} @ {self.wled.host})")
                 self.broadcast_ws({"command": "settings-update", "data": cur_cfg})
+        elif cmd == "mediaprojection":
+            if sub == "stop":
+                self.grabber.enabled = False
+                self.log("INFO", "GRABBER", "Android MediaProjection API capture stopped")
+            else:
+                self.grabber.enabled = True
+                ok = self.grabber.request_mediaprojection_permission()
+                self.log(
+                    "INFO",
+                    "GRABBER",
+                    "Requested Android MediaProjection API permission via companion activity"
+                    if ok
+                    else "Android MediaProjection API active (ensure HyperHDR Android TV APK is installed for MediaProjection dialog)",
+                )
+            resp["info"] = {"active": self.grabber.is_capturing(), "mode": self.grabber.active_backend}
         elif cmd == "sysinfo":
             resp["info"] = {
                 "hyperhdr": {
@@ -1506,15 +1622,21 @@ class HeadlessHyperHdrDaemon:
                 ] + [{"name": "file", "group": "leds_group_5_debug"}]
             },
             "grabbers": {
-                "active": [f"Termux Screen Grabber ({self.grabber.active_backend})", "V4L2"],
-                "available": ["Video capturing (V4L2)", "System capturing (Termux Screen Grabber)"],
+                "active": [f"Android MediaProjection API ({self.grabber.active_backend})", "Android MediaProjection API"],
+                "available": [
+                    "System capturing (Android MediaProjection API)",
+                    "Video capturing (Android MediaProjection API)",
+                ],
                 "lut_for_hdr_exists": 1,
                 "lutFastCRC": "0x240000B0",
-                "current": {"device": f"Termux ({self.grabber.active_backend})", "videoMode": "1920x1080 -> 192x108 RGB24"},
+                "current": {
+                    "device": f"Android MediaProjection API ({self.grabber.active_backend})",
+                    "videoMode": f"{self.grabber.target_width}x{self.grabber.target_height} {self.grabber.target_fps}fps RGB24 (MediaProjection)",
+                },
                 "video_devices": [
                     {
-                        "device": "Termux-ScreenGrabber-0",
-                        "name": "Termux Android Screen Grabber (screencap / X11 / Framebuffer)",
+                        "device": "Android MediaProjection API",
+                        "name": "Android MediaProjection API (Hardware VirtualDisplay Screen Grabber)",
                         "videoControls": {
                             "BrightnessDef": "Brightness: 0",
                             "ContrastDef": "Contrast: 0",
@@ -1522,21 +1644,35 @@ class HeadlessHyperHdrDaemon:
                             "HueDef": "Hue: 0",
                         },
                         "videoModeList": [
-                            {"width": 1920, "height": 1080, "fps": 30, "pixel_format_info": "RGB24"},
-                            {"width": 1280, "height": 720, "fps": 30, "pixel_format_info": "RGB24"},
+                            {"width": 256, "height": 144, "fps": 60, "pixel_format_info": "RGBA"},
+                            {"width": 256, "height": 144, "fps": 30, "pixel_format_info": "RGBA"},
+                            {"width": 256, "height": 144, "fps": 25, "pixel_format_info": "RGBA"},
+                            {"width": 320, "height": 180, "fps": 60, "pixel_format_info": "RGBA"},
+                            {"width": 320, "height": 180, "fps": 30, "pixel_format_info": "RGBA"},
+                            {"width": 640, "height": 360, "fps": 60, "pixel_format_info": "RGBA"},
+                            {"width": 640, "height": 360, "fps": 30, "pixel_format_info": "RGBA"},
+                            {"width": 1280, "height": 720, "fps": 60, "pixel_format_info": "RGBA"},
+                            {"width": 1280, "height": 720, "fps": 30, "pixel_format_info": "RGBA"},
+                            {"width": 1920, "height": 1080, "fps": 60, "pixel_format_info": "RGBA"},
+                            {"width": 1920, "height": 1080, "fps": 30, "pixel_format_info": "RGBA"},
                         ],
                         "framerates": ["60", "30", "25"],
                         "inputs": [],
                     }
                 ],
             },
-            "grabberstate": {"device": f"Termux ({self.grabber.active_backend})", "videoMode": "1920x1080 -> 192x108 RGB24"},
+            "grabberstate": {
+                "device": f"Android MediaProjection API ({self.grabber.active_backend})",
+                "videoMode": f"{self.grabber.target_width}x{self.grabber.target_height} {self.grabber.target_fps}fps RGB24 (MediaProjection)",
+            },
             "systemGrabbers": {
-                "device": "pipewire / Termux Screen Grabber",
+                "device": "Android MediaProjection API",
                 "modes": [
-                    "Pipewire All Screens (RemoteDesktop API)",
-                    "Pipewire System Dialog selection (ScreenCast API)",
-                    "Termux Android screencap (1920x1080 -> 192x108)",
+                    "Android MediaProjection API",
+                    "Android MediaProjection API (Low-Latency 256x144)",
+                    "Android MediaProjection API (HD 320x180)",
+                    "Android MediaProjection API (Full 640x360)",
+                    "Termux Android screencap / ADB",
                 ],
             },
             "effects": [

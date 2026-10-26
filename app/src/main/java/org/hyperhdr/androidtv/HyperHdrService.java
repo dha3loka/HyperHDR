@@ -17,6 +17,7 @@ public class HyperHdrService extends Service {
     public static final String ACTION_START_SERVER = "org.hyperhdr.androidtv.ACTION_START_SERVER";
     public static final String ACTION_START_CAPTURE = "org.hyperhdr.androidtv.ACTION_START_CAPTURE";
     public static final String ACTION_STOP_CAPTURE = "org.hyperhdr.androidtv.ACTION_STOP_CAPTURE";
+    public static final String ACTION_REQUEST_MEDIA_PROJECTION = "org.hyperhdr.androidtv.ACTION_REQUEST_MEDIA_PROJECTION";
     public static final String EXTRA_RESULT_CODE = "result_code";
     public static final String EXTRA_RESULT_DATA = "result_data";
 
@@ -24,6 +25,8 @@ public class HyperHdrService extends Service {
     private static final int NOTIF_ID = 2400;
 
     private static volatile HyperHdrService instance;
+    private static volatile int cachedResultCode = 0;
+    private static volatile Intent cachedResultData = null;
 
     private WledDriver wledDriver;
     private InfiniteColorEngine colorEngine;
@@ -34,18 +37,25 @@ public class HyperHdrService extends Service {
         return instance;
     }
 
+    public static void setMediaProjectionPermission(int resultCode, Intent data) {
+        cachedResultCode = resultCode;
+        cachedResultData = data;
+    }
+
     @Override
     public void onCreate() {
         super.onCreate();
         instance = this;
         createNotificationChannel();
-        promoteToForeground(false);
 
         wledDriver = new WledDriver();
         colorEngine = new InfiniteColorEngine(wledDriver);
         screenCaptureManager = new ScreenCaptureManager(this, colorEngine);
         server = new HyperHdrServer(this, colorEngine, wledDriver, screenCaptureManager);
         server.start();
+
+        // Safely attempt foreground promotion without mediaProjection type before consent is granted
+        promoteToForeground(false);
     }
 
     @Override
@@ -53,38 +63,109 @@ public class HyperHdrService extends Service {
         if (intent != null && intent.getAction() != null) {
             String action = intent.getAction();
             if (ACTION_START_CAPTURE.equals(action)) {
-                int resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0);
+                int resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, cachedResultCode);
                 Intent data = intent.getParcelableExtra(EXTRA_RESULT_DATA);
-                promoteToForeground(true);
+                if (data == null) {
+                    data = cachedResultData;
+                }
                 if (data != null) {
-                    boolean ok = screenCaptureManager.startCapture(resultCode, data);
-                    server.appendLog(ok ? "INFO" : "ERROR", "GRABBER",
-                            ok ? "Android TV MediaProjection screen capture started (192x108 low-latency RGBA)"
-                               : "Failed to start MediaProjection screen capture");
-                    promoteToForeground(ok);
+                    startMediaProjectionCapture(resultCode, data);
+                } else {
+                    server.appendLog("ERROR", "GRABBER", "MediaProjection intent data was null; requesting permission dialog");
+                    requestMediaProjectionFromUi(false);
                 }
             } else if (ACTION_STOP_CAPTURE.equals(action)) {
                 screenCaptureManager.stopCapture();
-                server.appendLog("INFO", "GRABBER", "Android TV MediaProjection screen capture stopped");
+                server.appendLog("INFO", "GRABBER", "Android MediaProjection API screen capture stopped");
                 promoteToForeground(false);
+                if (server != null) {
+                    server.notifyGrabberStateChanged();
+                }
+            } else if (ACTION_REQUEST_MEDIA_PROJECTION.equals(action)) {
+                requestMediaProjectionFromUi(intent.getBooleanExtra("headless_bridge", false));
             }
         }
         return START_STICKY;
     }
 
-    private void promoteToForeground(boolean withMediaProjectionType) {
-        Notification notification = buildNotification();
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            int type = withMediaProjectionType
-                    ? ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-                    : ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE;
-            try {
-                startForeground(NOTIF_ID, notification, type);
-            } catch (Exception e) {
-                startForeground(NOTIF_ID, notification);
-            }
+    public synchronized boolean startMediaProjectionCapture(int resultCode, Intent data) {
+        if (data == null) return false;
+        cachedResultCode = resultCode;
+        cachedResultData = data;
+
+        // Android 10+ requires foreground service with FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION before getMediaProjection()
+        promoteToForeground(true);
+
+        if (screenCaptureManager.isMediaProjectionActive()) {
+            return true;
+        }
+        boolean ok = screenCaptureManager.startCapture(resultCode, data);
+        if (ok) {
+            colorEngine.setComponentState("GRABBER", true);
+            colorEngine.setComponentState("SYSTEMGRABBER", true);
+            colorEngine.setComponentState("VIDEOGRABBER", true);
+            server.appendLog("INFO", "GRABBER",
+                    "Android MediaProjection API capture started ("
+                            + screenCaptureManager.getCaptureWidth() + "x" + screenCaptureManager.getCaptureHeight()
+                            + " @ " + screenCaptureManager.getTargetFps() + "fps RGBA)");
         } else {
-            startForeground(NOTIF_ID, notification);
+            server.appendLog("ERROR", "GRABBER",
+                    "Failed to start Android MediaProjection API: " + screenCaptureManager.getLastError());
+        }
+        promoteToForeground(ok);
+        if (server != null) {
+            server.notifyGrabberStateChanged();
+        }
+        return ok;
+    }
+
+    public void requestMediaProjectionFromUi(boolean headlessBridge) {
+        try {
+            if (screenCaptureManager != null && screenCaptureManager.isMediaProjectionActive()) {
+                return;
+            }
+            if (cachedResultData != null && cachedResultCode != 0) {
+                if (startMediaProjectionCapture(cachedResultCode, cachedResultData)) {
+                    return;
+                }
+            }
+            Intent reqIntent = new Intent(this, MainActivity.class);
+            reqIntent.setAction(ACTION_REQUEST_MEDIA_PROJECTION);
+            reqIntent.putExtra("headless_bridge", headlessBridge);
+            reqIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            startActivity(reqIntent);
+            if (server != null) {
+                server.appendLog("INFO", "GRABBER", "Launched Android MediaProjection API permission prompt on screen");
+            }
+        } catch (Throwable t) {
+            if (server != null) {
+                server.appendLog("ERROR", "GRABBER", "Could not launch MediaProjection dialog: " + t.getMessage());
+            }
+        }
+    }
+
+    private void promoteToForeground(boolean withMediaProjectionType) {
+        try {
+            Notification notification = buildNotification();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                if (withMediaProjectionType) {
+                    try {
+                        startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+                        return;
+                    } catch (Throwable ignored) {
+                    }
+                }
+                try {
+                    startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE);
+                    return;
+                } catch (Throwable ignored) {
+                }
+            }
+            try {
+                startForeground(NOTIF_ID, notification);
+            } catch (Throwable ignored) {
+            }
+        } catch (Throwable ignored) {
         }
     }
 
@@ -102,7 +183,7 @@ public class HyperHdrService extends Service {
                 : new Notification.Builder(this);
 
         builder.setContentTitle("HyperHDR v24.0.0-beta.0 Server (" + ip + ":" + port + ")")
-                .setContentText((cap ? "Screen Capture: ACTIVE | " : "Screen Capture: Idle | ")
+                .setContentText((cap ? "MediaProjection: ACTIVE | " : "MediaProjection: Ready | ")
                         + "WLED: " + (wledDriver != null ? wledDriver.getHost() : ""))
                 .setSmallIcon(R.drawable.app_icon)
                 .setContentIntent(pi)
@@ -120,7 +201,7 @@ public class HyperHdrService extends Service {
                         "HyperHDR v24.0.0-beta.0 Server",
                         NotificationManager.IMPORTANCE_LOW
                 );
-                ch.setDescription("Runs the HyperHDR v24.0.0-beta.0 Web UI (:8090), Screen Grabber, and WLED driver");
+                ch.setDescription("Runs the HyperHDR v24.0.0-beta.0 Web UI (:8090), Android MediaProjection API Grabber, and WLED driver");
                 nm.createNotificationChannel(ch);
             }
         }

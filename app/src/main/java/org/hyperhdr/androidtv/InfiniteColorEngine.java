@@ -128,12 +128,23 @@ public class InfiniteColorEngine {
         components.put("LEDDEVICE", true);
         components.put("HDR", false);
 
-        // Register default system grabber priority 250
+        // Register default video & system grabber priorities (240 & 250)
+        PriorityEntry vidGrab = new PriorityEntry();
+        vidGrab.priority = 240;
+        vidGrab.componentId = "VIDEOGRABBER";
+        vidGrab.origin = "System";
+        vidGrab.owner = "Android MediaProjection API";
+        vidGrab.active = true;
+        vidGrab.visible = false;
+        vidGrab.durationMs = -1;
+        vidGrab.expiresAtMs = -1;
+        priorities.put(240, vidGrab);
+
         PriorityEntry sysGrab = new PriorityEntry();
         sysGrab.priority = 250;
         sysGrab.componentId = "SYSTEMGRABBER";
         sysGrab.origin = "System";
-        sysGrab.owner = "Android TV Screen Grabber";
+        sysGrab.owner = "Android MediaProjection API";
         sysGrab.active = true;
         sysGrab.visible = true;
         sysGrab.durationMs = -1;
@@ -212,8 +223,18 @@ public class InfiniteColorEngine {
         if (sysCtrl != null) {
             boolean sysEn = sysCtrl.optBoolean("systemInstanceEnable", true);
             components.put("SYSTEMGRABBER", sysEn);
-            components.put("GRABBER", sysEn || Boolean.TRUE.equals(components.get("VIDEOGRABBER")));
+            PriorityEntry sg = priorities.get(250);
+            if (sg != null) sg.active = sysEn;
         }
+        JSONObject vidCtrl = rootConfig.optJSONObject("videoControl");
+        if (vidCtrl != null) {
+            boolean vidEn = vidCtrl.optBoolean("videoInstanceEnable", true);
+            components.put("VIDEOGRABBER", vidEn);
+            PriorityEntry vg = priorities.get(240);
+            if (vg != null) vg.active = vidEn;
+        }
+        components.put("GRABBER", Boolean.TRUE.equals(components.get("SYSTEMGRABBER")) || Boolean.TRUE.equals(components.get("VIDEOGRABBER")));
+        recomputeVisiblePriority();
 
         // 6. Background effect
         JSONObject bgEff = rootConfig.optJSONObject("backgroundEffect");
@@ -325,10 +346,21 @@ public class InfiniteColorEngine {
             components.put("ALL", state);
             wledDriver.setEnabled(state && Boolean.TRUE.equals(components.get("LEDDEVICE")));
         } else if ("GRABBER".equals(comp) || "SYSTEMGRABBER".equals(comp) || "V4L".equals(comp) || "VIDEOGRABBER".equals(comp)) {
-            components.put(comp, state);
-            if ("GRABBER".equals(comp) || "SYSTEMGRABBER".equals(comp)) {
+            if ("V4L".equals(comp) || "VIDEOGRABBER".equals(comp)) {
+                components.put("VIDEOGRABBER", state);
+                components.put("V4L", state);
+            } else if ("SYSTEMGRABBER".equals(comp)) {
+                components.put("SYSTEMGRABBER", state);
+            } else {
                 components.put("GRABBER", state);
                 components.put("SYSTEMGRABBER", state);
+                components.put("VIDEOGRABBER", state);
+            }
+            boolean anyGrab = Boolean.TRUE.equals(components.get("SYSTEMGRABBER")) || Boolean.TRUE.equals(components.get("VIDEOGRABBER"));
+            components.put("GRABBER", anyGrab);
+            PriorityEntry vidGrab = priorities.get(240);
+            if (vidGrab != null) {
+                vidGrab.active = Boolean.TRUE.equals(components.get("VIDEOGRABBER"));
             }
             PriorityEntry sysGrab = priorities.get(250);
             if (sysGrab != null) {
@@ -420,7 +452,7 @@ public class InfiniteColorEngine {
             clearAllPriorities();
             return;
         }
-        if (priority != 250) {
+        if (priority != 240 && priority != 250) {
             priorities.remove(priority);
         }
         recomputeVisiblePriority();
@@ -428,7 +460,7 @@ public class InfiniteColorEngine {
 
     public void clearAllPriorities() {
         for (Integer k : new ArrayList<>(priorities.keySet())) {
-            if (k < 250) {
+            if (k < 240) {
                 priorities.remove(k);
             }
         }
@@ -556,7 +588,8 @@ public class InfiniteColorEngine {
                 int[] frame = this.latestScreenRgba;
                 int fw = this.latestScreenWidth;
                 int fh = this.latestScreenHeight;
-                if (frame != null && fw > 0 && fh > 0 && getComponentState("SYSTEMGRABBER") && getComponentState("GRABBER")) {
+                boolean grabEnabled = getComponentState("GRABBER") && (getComponentState("SYSTEMGRABBER") || getComponentState("VIDEOGRABBER"));
+                if (frame != null && fw > 0 && fh > 0 && grabEnabled) {
                     sampleFrameToLeds(frame, fw, fh, zones, rawLedRgb);
                 } else {
                     renderEffect("Warm mood blobs", ledCount, zones, rawLedRgb);

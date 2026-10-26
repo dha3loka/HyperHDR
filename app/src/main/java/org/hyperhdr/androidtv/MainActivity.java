@@ -47,6 +47,8 @@ public class MainActivity extends Activity {
     private int testModeStep = 0;
     private boolean webLoaded = false;
     private boolean autoCapturePrompted = false;
+    private boolean headlessBridgeRequested = false;
+    private boolean permissionDialogPending = false;
 
     private final Runnable statusRefreshRunnable = new Runnable() {
         @Override
@@ -81,7 +83,7 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams statusLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
         topBar.addView(statusText, statusLp);
 
-        btnCaptureToggle = createTvButton("Start TV Capture", Color.rgb(16, 185, 129));
+        btnCaptureToggle = createTvButton("Start MediaProjection", Color.rgb(16, 185, 129));
         btnCaptureToggle.setOnClickListener(v -> onToggleScreenCapture());
         topBar.addView(btnCaptureToggle, createBtnParams());
 
@@ -96,7 +98,9 @@ public class MainActivity extends Activity {
         btnReloadWeb = createTvButton("Reload UI (:8090)", Color.rgb(71, 85, 105));
         btnReloadWeb.setOnClickListener(v -> {
             if (webView != null) {
-                webView.loadUrl("http://127.0.0.1:8090/");
+                HyperHdrService svc = HyperHdrService.getInstance();
+                int port = (svc != null && svc.getServer() != null) ? svc.getServer().getHttpPort() : 8090;
+                webView.loadUrl("http://127.0.0.1:" + port + "/");
             }
         });
         topBar.addView(btnReloadWeb, createBtnParams());
@@ -122,6 +126,24 @@ public class MainActivity extends Activity {
         setContentView(root);
 
         btnCaptureToggle.requestFocus();
+        handleIncomingIntent(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleIncomingIntent(intent);
+    }
+
+    private void handleIncomingIntent(Intent intent) {
+        if (intent == null) return;
+        String action = intent.getAction();
+        if (HyperHdrService.ACTION_REQUEST_MEDIA_PROJECTION.equals(action)
+                || intent.getBooleanExtra("auto_projection", false)) {
+            headlessBridgeRequested = intent.getBooleanExtra("headless_bridge", false);
+            uiHandler.postDelayed(this::requestMediaProjectionConsent, 250);
+        }
     }
 
     @Override
@@ -139,10 +161,16 @@ public class MainActivity extends Activity {
     private void startHyperHdrService() {
         Intent svc = new Intent(this, HyperHdrService.class);
         svc.setAction(HyperHdrService.ACTION_START_SERVER);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(svc);
-        } else {
+        try {
+            // Activity is in foreground, so startService() succeeds without requiring pre-consent mediaProjection FGS
             startService(svc);
+        } catch (Throwable t) {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(svc);
+                }
+            } catch (Throwable ignored) {
+            }
         }
     }
 
@@ -151,21 +179,22 @@ public class MainActivity extends Activity {
         HyperHdrService svc = HyperHdrService.getInstance();
         if (svc == null) {
             statusText.setText("Starting HyperHDR v24.0.0-beta.0 Server on " + ip + ":8090 ...");
+            startHyperHdrService();
             return;
         }
         if (!webLoaded && webView != null) {
             webLoaded = true;
             webView.loadUrl("http://127.0.0.1:" + svc.getServer().getHttpPort() + "/");
         }
-        boolean capturing = svc.getScreenCaptureManager().isCapturing();
-        if (!capturing && !autoCapturePrompted) {
+        boolean mpActive = svc.getScreenCaptureManager().isMediaProjectionActive();
+        if (!mpActive && !autoCapturePrompted) {
             autoCapturePrompted = true;
             uiHandler.postDelayed(() -> {
                 HyperHdrService s = HyperHdrService.getInstance();
-                if (s != null && !s.getScreenCaptureManager().isCapturing()) {
+                if (s != null && !s.getScreenCaptureManager().isMediaProjectionActive()) {
                     requestMediaProjectionConsent();
                 }
-            }, 600);
+            }, 500);
         }
         String wledHost = svc.getWledDriver().getHost();
         double fps = svc.getWledDriver().getCurrentLedFps();
@@ -175,34 +204,42 @@ public class MainActivity extends Activity {
 
         statusText.setText(String.format(Locale.US,
                 "HyperHDR v24.0.0-beta.0  •  Web UI: http://%s:%d  •  Capture: %s  •  WLED: %s (%d LEDs @ %.0f fps)",
-                ip, port, capturing ? ("ACTIVE (" + mode + ")") : "IDLE", wledHost, leds, fps));
+                ip, port, mpActive ? ("ACTIVE (" + mode + ")") : "READY (Click Start MediaProjection)", wledHost, leds, fps));
 
-        if (capturing) {
-            btnCaptureToggle.setText("Stop TV Capture");
+        if (mpActive) {
+            btnCaptureToggle.setText("Stop MediaProjection");
             styleButton(btnCaptureToggle, Color.rgb(220, 38, 38), btnCaptureToggle.hasFocus());
         } else {
-            btnCaptureToggle.setText("Start TV Capture");
+            btnCaptureToggle.setText("Start MediaProjection");
             styleButton(btnCaptureToggle, Color.rgb(16, 185, 129), btnCaptureToggle.hasFocus());
         }
     }
 
-    private void requestMediaProjectionConsent() {
+    public void requestMediaProjectionConsent() {
+        if (permissionDialogPending) return;
+        HyperHdrService svc = HyperHdrService.getInstance();
+        if (svc != null && svc.getScreenCaptureManager().isMediaProjectionActive()) {
+            return;
+        }
         try {
             MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
             if (mpm != null) {
+                permissionDialogPending = true;
                 startActivityForResult(mpm.createScreenCaptureIntent(), REQ_MEDIA_PROJECTION);
             }
-        } catch (Exception ignored) {
+        } catch (Throwable e) {
+            permissionDialogPending = false;
+            Toast.makeText(this, "MediaProjection error: " + e.getMessage(), Toast.LENGTH_LONG).show();
         }
     }
 
     private void onToggleScreenCapture() {
         HyperHdrService svc = HyperHdrService.getInstance();
-        if (svc != null && svc.getScreenCaptureManager().isCapturing()) {
+        if (svc != null && svc.getScreenCaptureManager().isMediaProjectionActive()) {
             Intent stopIntent = new Intent(this, HyperHdrService.class);
             stopIntent.setAction(HyperHdrService.ACTION_STOP_CAPTURE);
             startService(stopIntent);
-            Toast.makeText(this, "Stopped TV screen capture", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Stopped Android MediaProjection capture", Toast.LENGTH_SHORT).show();
             return;
         }
         requestMediaProjectionConsent();
@@ -212,19 +249,31 @@ public class MainActivity extends Activity {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQ_MEDIA_PROJECTION) {
+            permissionDialogPending = false;
             if (resultCode == Activity.RESULT_OK && data != null) {
-                Intent capIntent = new Intent(this, HyperHdrService.class);
-                capIntent.setAction(HyperHdrService.ACTION_START_CAPTURE);
-                capIntent.putExtra(HyperHdrService.EXTRA_RESULT_CODE, resultCode);
-                capIntent.putExtra(HyperHdrService.EXTRA_RESULT_DATA, data);
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    startForegroundService(capIntent);
+                HyperHdrService.setMediaProjectionPermission(resultCode, data);
+                HyperHdrService svc = HyperHdrService.getInstance();
+                if (svc != null) {
+                    svc.startMediaProjectionCapture(resultCode, data);
                 } else {
-                    startService(capIntent);
+                    Intent capIntent = new Intent(this, HyperHdrService.class);
+                    capIntent.setAction(HyperHdrService.ACTION_START_CAPTURE);
+                    capIntent.putExtra(HyperHdrService.EXTRA_RESULT_CODE, resultCode);
+                    capIntent.putExtra(HyperHdrService.EXTRA_RESULT_DATA, data);
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(capIntent);
+                    } else {
+                        startService(capIntent);
+                    }
                 }
-                Toast.makeText(this, "HyperHDR v24.0.0-beta.0 Screen Capture Active! Works in background across TV apps.", Toast.LENGTH_LONG).show();
+                updateStatusBar();
+                Toast.makeText(this, "Android MediaProjection API Screen Capture Active!", Toast.LENGTH_LONG).show();
+                if (headlessBridgeRequested) {
+                    headlessBridgeRequested = false;
+                    uiHandler.postDelayed(() -> moveTaskToBack(true), 350);
+                }
             } else {
-                Toast.makeText(this, "Screen capture permission was not granted", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "MediaProjection screen capture permission was not granted", Toast.LENGTH_SHORT).show();
             }
         }
     }
@@ -307,7 +356,7 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "Test Color: Warm Bias Light", Toast.LENGTH_SHORT).show();
         } else {
             svc.getColorEngine().clearAllPriorities();
-            Toast.makeText(this, "Cleared override — Live TV Screen Capture active", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Cleared override — Live Android MediaProjection Capture active", Toast.LENGTH_SHORT).show();
         }
     }
 

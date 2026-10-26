@@ -36,7 +36,13 @@ echo "[1/5] Compiling Android resources and linking AndroidManifest.xml + Web UI
     --version-name "24.0.0-beta.0" \
     "$BUILD_TMP/app_res.zip"
 
-echo "[2/5] Compiling Java sources..."
+echo "[2/5] Compiling Android stubs and Java sources..."
+mkdir -p "$BUILD_TMP/stub_classes"
+javac -source 11 -target 11 -g:none \
+    -d "$BUILD_TMP/stub_classes" \
+    $(find "$PROJ_DIR/build-tools/stubs_src" -name "*.java")
+jar cf "$PROJ_DIR/build-tools/android-stubs.jar" -C "$BUILD_TMP/stub_classes" .
+
 javac -source 11 -target 11 -g:none \
     -cp "$PROJ_DIR/build-tools/android-stubs.jar" \
     -d "$BUILD_TMP/app_classes" \

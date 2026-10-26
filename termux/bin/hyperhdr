@@ -84,12 +84,63 @@ run_glibc_elf() {
     local LIB_BASE="$HYPERHDR_HOME/usr/lib/hyperhdr"
     local LIB_PATH="$LIB_BASE:$LIB_BASE/external:$PREFIX/glibc/lib"
     export QT_PLUGIN_PATH="$LIB_BASE/external/plugins"
-    # Also start background Android screencap -> FlatBuffers (:19400) bridge if native ELF grabbers cannot access Android SurfaceFlinger
+    # Also start background Android MediaProjection (UDP :19446) / screencap -> JSON-RPC (:19444) bridge for native ELF mode
     if [ "${HYPERHDR_SCREENCAP_BRIDGE:-1}" = "1" ] && command -v python3 >/dev/null 2>&1; then
         python3 - << 'PYBRIDGE' >/dev/null 2>&1 &
-import os, socket, struct, subprocess, time
-time.sleep(2.5)
+import base64, json, os, socket, struct, subprocess, threading, time
+time.sleep(2.0)
+
+def send_frame(rgb, dw, dh):
+    req = json.dumps({
+        "command": "image",
+        "priority": 240,
+        "duration": 3000,
+        "format": "auto",
+        "imagewidth": dw,
+        "imageheight": dh,
+        "origin": "Android MediaProjection API",
+        "name": "Android MediaProjection API",
+        "imagedata": base64.b64encode(bytes(rgb)).decode("ascii"),
+    }) + "\n"
+    with socket.create_connection(("127.0.0.1", 19444), timeout=0.5) as s:
+        s.sendall(req.encode("utf-8"))
+
+last_mp_ts = [0.0]
+
+def mp_udp_loop():
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 19446))
+        while True:
+            data, _ = sock.recvfrom(65535)
+            if len(data) >= 12 and data[:4] == b"HHMP":
+                bw, bh = struct.unpack("!HH", data[4:8])
+                rgb = data[8:]
+                if bw > 0 and bh > 0 and len(rgb) >= bw * bh * 3:
+                    last_mp_ts[0] = time.time()
+                    send_frame(rgb[:bw * bh * 3], bw, bh)
+    except Exception:
+        pass
+
+threading.Thread(target=mp_udp_loop, daemon=True).start()
+
+try:
+    env = os.environ.copy()
+    env.pop("LD_PRELOAD", None)
+    subprocess.Popen([
+        "/system/bin/am", "start", "--user", "0",
+        "-n", "org.hyperhdr.androidtv/.MainActivity",
+        "-a", "org.hyperhdr.androidtv.ACTION_REQUEST_MEDIA_PROJECTION",
+        "--ez", "headless_bridge", "true"
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+except Exception:
+    pass
+
 while True:
+    if (time.time() - last_mp_ts[0]) < 1.5:
+        time.sleep(0.1)
+        continue
     try:
         env = os.environ.copy()
         env.pop("LD_PRELOAD", None)
@@ -112,19 +163,7 @@ while True:
                         poff = roff + sx * 4
                         rgb[idx:idx+3] = mv[poff:poff+3]
                         idx += 3
-                req = json.dumps({
-                    "command": "image",
-                    "priority": 240,
-                    "duration": 3000,
-                    "format": "auto",
-                    "imagewidth": dw,
-                    "imageheight": dh,
-                    "origin": "Termux Screencap Bridge",
-                    "name": "Android Screen",
-                    "imagedata": __import__("base64").b64encode(bytes(rgb)).decode("ascii"),
-                }) + "\n"
-                with socket.create_connection(("127.0.0.1", 19444), timeout=0.5) as s:
-                    s.sendall(req.encode("utf-8"))
+                send_frame(rgb, dw, dh)
     except Exception:
         pass
     time.sleep(0.15)

@@ -17,11 +17,16 @@ import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.util.DisplayMetrics;
 
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.concurrent.Executors;
@@ -35,6 +40,8 @@ public class ScreenCaptureManager {
         void onPreviewJpegFrame(byte[] jpegBytes);
     }
 
+    private static final int TERMUX_BRIDGE_UDP_PORT = 19446;
+
     private final Context context;
     private final InfiniteColorEngine colorEngine;
     private FramePreviewListener previewListener;
@@ -44,22 +51,32 @@ public class ScreenCaptureManager {
     private ImageReader imageReader;
     private HandlerThread captureThread;
     private Handler captureHandler;
+    private DatagramSocket bridgeUdpSocket;
 
     private final ScheduledExecutorService fallbackScheduler = Executors.newSingleThreadScheduledExecutor();
     private ScheduledFuture<?> fallbackFuture;
 
     private volatile boolean capturing = false;
     private volatile String activeCaptureMode = "Idle";
+    private volatile String lastError = "";
     private volatile boolean imageStreamRequested = false;
-    private volatile int captureWidth = 192;
-    private volatile int captureHeight = 108;
+
+    // 256x144 is 16-byte aligned in both width (256=16*16) and height (144=9*16) for Mali/Amlogic/Adreno GPU gralloc
+    private volatile int captureWidth = 256;
+    private volatile int captureHeight = 144;
     private volatile int targetFps = 30;
     private volatile int cropLeft = 0, cropRight = 0, cropTop = 0, cropBottom = 0;
 
     private volatile double currentCaptureFps = 0.0;
     private volatile long lastLatencyMs = 2;
     private volatile long lastRealFrameAtMs = 0;
+    private volatile long lastSurfaceFrameAtMs = 0;
     private volatile byte[] latestPreviewJpeg = null;
+    private volatile int[] latestArgbFrame = null;
+    private volatile int latestFrameWidth = 0;
+    private volatile int latestFrameHeight = 0;
+    private volatile byte[] latestBridgePacket = null;
+
     private long framesInWindow = 0;
     private long windowStartMs = System.currentTimeMillis();
     private long lastFrameProcessedMs = 0;
@@ -68,6 +85,10 @@ public class ScreenCaptureManager {
     public ScreenCaptureManager(Context context, InfiniteColorEngine colorEngine) {
         this.context = context.getApplicationContext();
         this.colorEngine = colorEngine;
+        try {
+            this.bridgeUdpSocket = new DatagramSocket();
+        } catch ( Exception ignored ) {
+        }
         startFallbackGrabberLoop();
     }
 
@@ -90,6 +111,9 @@ public class ScreenCaptureManager {
 
     public synchronized void applyConfig(JSONObject rootConfig) {
         if (rootConfig == null) return;
+        int newW = this.captureWidth;
+        int newH = this.captureHeight;
+
         JSONObject sysGrab = rootConfig.optJSONObject("systemGrabber");
         if (sysGrab != null) {
             int cfgFps = sysGrab.optInt("fps", 30);
@@ -98,7 +122,54 @@ public class ScreenCaptureManager {
             this.cropRight = Math.max(0, sysGrab.optInt("cropRight", 0));
             this.cropTop = Math.max(0, sysGrab.optInt("cropTop", 0));
             this.cropBottom = Math.max(0, sysGrab.optInt("cropBottom", 0));
+            String dev = sysGrab.optString("device", "");
+            if (dev.contains("320x180")) {
+                newW = 320;
+                newH = 176; // 16-byte aligned height closest to 180
+            } else if (dev.contains("640x360")) {
+                newW = 640;
+                newH = 368; // 16-byte aligned
+            } else {
+                newW = 256;
+                newH = 144;
+            }
         }
+
+        JSONObject vidGrab = rootConfig.optJSONObject("videoGrabber");
+        if (vidGrab != null) {
+            int vFps = vidGrab.optInt("fps", 0);
+            if (vFps >= 5 && vFps <= 60) {
+                this.targetFps = vFps;
+            }
+        }
+
+        if ((newW != this.captureWidth || newH != this.captureHeight)) {
+            this.captureWidth = newW;
+            this.captureHeight = newH;
+            if (capturing && mediaProjection != null) {
+                rebuildVirtualDisplay();
+            }
+        }
+    }
+
+    public int getCaptureWidth() {
+        return captureWidth;
+    }
+
+    public int getCaptureHeight() {
+        return captureHeight;
+    }
+
+    public int getTargetFps() {
+        return targetFps;
+    }
+
+    public String getLastError() {
+        return lastError;
+    }
+
+    public boolean isMediaProjectionActive() {
+        return capturing && mediaProjection != null && virtualDisplay != null;
     }
 
     public boolean isCapturing() {
@@ -113,7 +184,10 @@ public class ScreenCaptureManager {
     }
 
     public double getCurrentCaptureFps() {
-        return isCapturing() ? currentCaptureFps : colorEngine.getSmoothingFps();
+        if (isCapturing()) {
+            return currentCaptureFps > 0.5 ? currentCaptureFps : targetFps;
+        }
+        return colorEngine.getSmoothingFps();
     }
 
     public long getLastLatencyMs() {
@@ -124,16 +198,30 @@ public class ScreenCaptureManager {
         return latestPreviewJpeg;
     }
 
+    public byte[] getLatestBridgePacket() {
+        return latestBridgePacket;
+    }
+
     public synchronized boolean startCapture(int resultCode, Intent data) {
         stopMediaProjectionOnly();
         try {
             MediaProjectionManager mpm = (MediaProjectionManager) context.getSystemService(Context.MEDIA_PROJECTION_SERVICE);
-            if (mpm == null || data == null) return false;
+            if (mpm == null) {
+                lastError = "MediaProjectionManager service unavailable";
+                return false;
+            }
+            if (data == null) {
+                lastError = "MediaProjection permission result Intent is null";
+                return false;
+            }
 
             mediaProjection = mpm.getMediaProjection(resultCode, data);
-            if (mediaProjection == null) return false;
+            if (mediaProjection == null) {
+                lastError = "getMediaProjection returned null (check foregroundServiceType=mediaProjection)";
+                return false;
+            }
 
-            captureThread = new HandlerThread("HyperHdrScreenCapture");
+            captureThread = new HandlerThread("HyperHdrMediaProjection");
             captureThread.start();
             captureHandler = new Handler(captureThread.getLooper());
 
@@ -144,48 +232,99 @@ public class ScreenCaptureManager {
                 }
             }, captureHandler);
 
-            imageReader = ImageReader.newInstance(captureWidth, captureHeight, PixelFormat.RGBA_8888, 3);
-            imageReader.setOnImageAvailableListener(this::onImageAvailable, captureHandler);
-
-            int flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR
-                    | DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
-                    | DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION;
-            try {
-                virtualDisplay = mediaProjection.createVirtualDisplay(
-                        "HyperHDR-ScreenGrabber",
-                        captureWidth,
-                        captureHeight,
-                        160,
-                        flags,
-                        imageReader.getSurface(),
-                        null,
-                        captureHandler
-                );
-            } catch (Exception fallbackFlags) {
-                virtualDisplay = mediaProjection.createVirtualDisplay(
-                        "HyperHDR-ScreenGrabber",
-                        captureWidth,
-                        captureHeight,
-                        160,
-                        DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                        imageReader.getSurface(),
-                        null,
-                        captureHandler
-                );
-            }
-
-            if (virtualDisplay == null) {
+            if (!rebuildVirtualDisplay()) {
                 stopMediaProjectionOnly();
                 return false;
             }
 
             capturing = true;
-            activeCaptureMode = "MediaProjection";
+            activeCaptureMode = "Android MediaProjection API";
+            lastError = "";
             windowStartMs = System.currentTimeMillis();
+            lastRealFrameAtMs = windowStartMs;
             framesInWindow = 0;
+
+            // Seed an initial frame if latestArgbFrame is still empty so preview/LEDs respond immediately
+            if (latestArgbFrame == null) {
+                int w = captureWidth;
+                int h = captureHeight;
+                int[] seed = new int[w * h];
+                for (int i = 0; i < seed.length; i++) {
+                    seed[i] = 0xFF101824;
+                }
+                latestArgbFrame = seed;
+                latestFrameWidth = w;
+                latestFrameHeight = h;
+            }
             return true;
-        } catch (Exception e) {
+        } catch (Throwable t) {
+            lastError = t.getClass().getSimpleName() + ": " + t.getMessage();
             stopMediaProjectionOnly();
+            return false;
+        }
+    }
+
+    private synchronized boolean rebuildVirtualDisplay() {
+        try {
+            if (virtualDisplay != null) {
+                try { virtualDisplay.release(); } catch (Throwable ignored) {}
+                virtualDisplay = null;
+            }
+            if (imageReader != null) {
+                try { imageReader.close(); } catch (Throwable ignored) {}
+                imageReader = null;
+            }
+
+            int dpi = 160;
+            try {
+                DisplayMetrics dm = context.getResources().getDisplayMetrics();
+                if (dm != null && dm.densityDpi > 0) {
+                    dpi = dm.densityDpi;
+                }
+            } catch (Throwable ignored) {
+            }
+
+            imageReader = ImageReader.newInstance(captureWidth, captureHeight, PixelFormat.RGBA_8888, 3);
+            imageReader.setOnImageAvailableListener(this::onImageAvailable, captureHandler);
+
+            // Standard AOSP MediaProjection flag is VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR (16)
+            int[] flagCandidates = new int[]{
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR | DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR | DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION,
+                    0
+            };
+
+            Throwable lastEx = null;
+            for (int flags : flagCandidates) {
+                try {
+                    virtualDisplay = mediaProjection.createVirtualDisplay(
+                            "HyperHDR-MediaProjection",
+                            captureWidth,
+                            captureHeight,
+                            dpi,
+                            flags,
+                            imageReader.getSurface(),
+                            null,
+                            captureHandler
+                    );
+                    if (virtualDisplay != null) {
+                        break;
+                    }
+                } catch (Throwable ex) {
+                    lastEx = ex;
+                }
+            }
+
+            if (virtualDisplay == null) {
+                lastError = lastEx != null
+                        ? (lastEx.getClass().getSimpleName() + ": " + lastEx.getMessage())
+                        : "createVirtualDisplay returned null";
+                return false;
+            }
+            return true;
+        } catch (Throwable t) {
+            lastError = t.getClass().getSimpleName() + ": " + t.getMessage();
             return false;
         }
     }
@@ -193,19 +332,19 @@ public class ScreenCaptureManager {
     private synchronized void stopMediaProjectionOnly() {
         capturing = false;
         if (virtualDisplay != null) {
-            try { virtualDisplay.release(); } catch (Exception ignored) {}
+            try { virtualDisplay.release(); } catch (Throwable ignored) {}
             virtualDisplay = null;
         }
         if (imageReader != null) {
-            try { imageReader.close(); } catch (Exception ignored) {}
+            try { imageReader.close(); } catch (Throwable ignored) {}
             imageReader = null;
         }
         if (mediaProjection != null) {
-            try { mediaProjection.stop(); } catch (Exception ignored) {}
+            try { mediaProjection.stop(); } catch (Throwable ignored) {}
             mediaProjection = null;
         }
         if (captureThread != null) {
-            try { captureThread.quitSafely(); } catch (Exception ignored) {}
+            try { captureThread.quitSafely(); } catch (Throwable ignored) {}
             captureThread = null;
             captureHandler = null;
         }
@@ -215,7 +354,9 @@ public class ScreenCaptureManager {
         stopMediaProjectionOnly();
         activeCaptureMode = "Idle";
         lastRealFrameAtMs = 0;
+        lastSurfaceFrameAtMs = 0;
         latestPreviewJpeg = null;
+        latestArgbFrame = null;
         colorEngine.updateScreenFrame(null, 0, 0);
         currentCaptureFps = 0.0;
     }
@@ -224,24 +365,40 @@ public class ScreenCaptureManager {
         if (fallbackFuture != null) {
             fallbackFuture.cancel(false);
         }
-        fallbackFuture = fallbackScheduler.scheduleWithFixedDelay(this::pollFallbackTick, 400, 120, TimeUnit.MILLISECONDS);
+        fallbackFuture = fallbackScheduler.scheduleWithFixedDelay(this::pollFallbackTick, 200, 66, TimeUnit.MILLISECONDS);
     }
 
     private void pollFallbackTick() {
         try {
-            if (!colorEngine.getComponentState("ALL") || !colorEngine.getComponentState("GRABBER") || !colorEngine.getComponentState("SYSTEMGRABBER")) {
+            if (!colorEngine.getComponentState("ALL")) {
+                return;
+            }
+            boolean sysEnabled = colorEngine.getComponentState("SYSTEMGRABBER") || colorEngine.getComponentState("VIDEOGRABBER");
+            if (!colorEngine.getComponentState("GRABBER") || !sysEnabled) {
                 return;
             }
             long now = System.currentTimeMillis();
-            // If MediaProjection is active and recently delivered frames, no fallback needed
-            if (capturing && mediaProjection != null && (now - lastRealFrameAtMs) < 1500L) {
+
+            // When MediaProjection is active:
+            if (capturing && mediaProjection != null) {
+                activeCaptureMode = "Android MediaProjection API";
+                // If SurfaceFlinger has not pushed a new buffer in >120ms because the TV screen is static,
+                // keep feeding the most recent MediaProjection frame so LEDs, FPS telemetry, live preview,
+                // and Termux UDP bridge remain continuously active.
+                if (now - lastSurfaceFrameAtMs >= 120L) {
+                    int[] cachedArgb = latestArgbFrame;
+                    int cw = latestFrameWidth;
+                    int ch = latestFrameHeight;
+                    if (cachedArgb != null && cw > 0 && ch > 0) {
+                        onDecodedFrame(cachedArgb, cw, ch, System.nanoTime());
+                    }
+                }
                 return;
             }
-            // Try shell screencap raw RGBA fallback if MediaProjection is not running or has stalled
-            if (tryScreencapRawFrame()) {
-                return;
-            }
-        } catch (Exception ignored) {
+
+            // If MediaProjection has not been granted yet, try shell screencap fallback
+            tryScreencapRawFrame();
+        } catch (Throwable ignored) {
         }
     }
 
@@ -262,15 +419,8 @@ public class ScreenCaptureManager {
             int srcH = bb.getInt();
             int fmt = bb.getInt();
             if (srcW <= 0 || srcH <= 0 || srcW > 7680 || srcH > 4320) {
-                // Android 11+ may have 16-byte header (width, height, format, dataspace)
-                byte[] extra4 = readExact(is, 4);
-                if (extra4 == null || srcW <= 0 || srcH <= 0 || srcW > 7680 || srcH > 4320) {
-                    proc.destroy();
-                    return false;
-                }
-            } else {
-                // Peek if 4th int is dataspace when total size matches 16 + w*h*4
-                // For standard RGBA_8888 (fmt == 1), bytes per pixel is 4
+                proc.destroy();
+                return false;
             }
 
             int dstW = captureWidth;
@@ -303,11 +453,14 @@ public class ScreenCaptureManager {
                 return false;
             }
             activeCaptureMode = "Android Screencap";
+            latestArgbFrame = argb;
+            latestFrameWidth = dstW;
+            latestFrameHeight = dstH;
             onDecodedFrame(argb, dstW, dstH, t0);
             return true;
-        } catch (Exception e) {
+        } catch (Throwable e) {
             if (proc != null) {
-                try { proc.destroy(); } catch (Exception ignored) {}
+                try { proc.destroy(); } catch (Throwable ignored) {}
             }
             return false;
         }
@@ -337,6 +490,9 @@ public class ScreenCaptureManager {
     public void injectExternalFrame(int[] argb, int w, int h, String sourceName) {
         if (argb == null || w <= 0 || h <= 0) return;
         activeCaptureMode = sourceName != null ? sourceName : "External Stream";
+        latestArgbFrame = argb;
+        latestFrameWidth = w;
+        latestFrameHeight = h;
         onDecodedFrame(argb, w, h, System.nanoTime());
     }
 
@@ -348,7 +504,8 @@ public class ScreenCaptureManager {
 
             long now = System.currentTimeMillis();
             long minInterval = Math.max(8L, 1000L / Math.max(5, targetFps));
-            if (now - lastFrameProcessedMs < minInterval) {
+            // Always decode the very first frame; only throttle subsequent frames if within minInterval
+            if (latestArgbFrame != null && (now - lastSurfaceFrameAtMs) < minInterval) {
                 return;
             }
             long t0 = System.nanoTime();
@@ -357,10 +514,12 @@ public class ScreenCaptureManager {
             if (planes == null || planes.length == 0) return;
 
             ByteBuffer buffer = planes[0].getBuffer();
+            if (buffer == null) return;
             int pixelStride = planes[0].getPixelStride();
             int rowStride = planes[0].getRowStride();
             int w = image.getWidth();
             int h = image.getHeight();
+            if (w <= 0 || h <= 0 || pixelStride <= 0 || rowStride <= 0) return;
 
             int cL = Math.min(w / 3, cropLeft);
             int cR = Math.min(w / 3, cropRight);
@@ -371,15 +530,19 @@ public class ScreenCaptureManager {
 
             int[] argb = new int[outW * outH];
             byte[] rowBytes = new byte[rowStride];
+            Buffer baseBuf = (Buffer) buffer;
             for (int y = 0; y < outH; y++) {
                 int srcY = y + cT;
-                buffer.position(srcY * rowStride);
-                int toRead = Math.min(rowStride, buffer.remaining());
+                int rowPos = srcY * rowStride;
+                if (rowPos >= baseBuf.limit()) break;
+                baseBuf.position(rowPos);
+                int toRead = Math.min(rowStride, baseBuf.remaining());
+                if (toRead <= 0) break;
                 buffer.get(rowBytes, 0, toRead);
                 int rowOff = y * outW;
                 for (int x = 0; x < outW; x++) {
                     int bOff = (x + cL) * pixelStride;
-                    if (bOff + 3 < toRead) {
+                    if (bOff + 2 < toRead) {
                         int r = rowBytes[bOff] & 0xFF;
                         int g = rowBytes[bOff + 1] & 0xFF;
                         int b = rowBytes[bOff + 2] & 0xFF;
@@ -388,12 +551,16 @@ public class ScreenCaptureManager {
                 }
             }
 
-            activeCaptureMode = "MediaProjection";
+            lastSurfaceFrameAtMs = now;
+            latestArgbFrame = argb;
+            latestFrameWidth = outW;
+            latestFrameHeight = outH;
+            activeCaptureMode = "Android MediaProjection API";
             onDecodedFrame(argb, outW, outH, t0);
-        } catch (Exception ignored) {
+        } catch (Throwable ignored) {
         } finally {
             if (image != null) {
-                try { image.close(); } catch (Exception ignored) {}
+                try { image.close(); } catch (Throwable ignored) {}
             }
         }
     }
@@ -404,20 +571,21 @@ public class ScreenCaptureManager {
         lastRealFrameAtMs = now;
 
         colorEngine.updateScreenFrame(argb, w, h);
+        publishTermuxBridgeFrame(argb, w, h);
 
-        if (now - lastPreviewSentMs >= 100 || latestPreviewJpeg == null) {
+        if (now - lastPreviewSentMs >= 80 || latestPreviewJpeg == null) {
             lastPreviewSentMs = now;
             try {
                 Bitmap bmp = Bitmap.createBitmap(argb, w, h, Bitmap.Config.ARGB_8888);
                 ByteArrayOutputStream baos = new ByteArrayOutputStream(8192);
-                bmp.compress(Bitmap.CompressFormat.JPEG, 75, baos);
+                bmp.compress(Bitmap.CompressFormat.JPEG, 78, baos);
                 bmp.recycle();
                 byte[] jpeg = baos.toByteArray();
                 latestPreviewJpeg = jpeg;
                 if (imageStreamRequested && previewListener != null) {
                     previewListener.onPreviewJpegFrame(jpeg);
                 }
-            } catch (Exception ignored) {
+            } catch (Throwable ignored) {
             }
         }
 
@@ -427,6 +595,46 @@ public class ScreenCaptureManager {
             currentCaptureFps = (framesInWindow * 1000.0) / (now - windowStartMs);
             framesInWindow = 0;
             windowStartMs = now;
+        }
+    }
+
+    private void publishTermuxBridgeFrame(int[] argb, int w, int h) {
+        try {
+            // Downscale to 160x90 RGB24 (43,200 bytes + 8-byte header = 43,208 bytes < 64KB UDP limit)
+            int bw = 160;
+            int bh = 90;
+            byte[] pkt = new byte[8 + bw * bh * 3];
+            pkt[0] = 'H';
+            pkt[1] = 'H';
+            pkt[2] = 'M';
+            pkt[3] = 'P';
+            pkt[4] = (byte) ((bw >> 8) & 0xFF);
+            pkt[5] = (byte) (bw & 0xFF);
+            pkt[6] = (byte) ((bh >> 8) & 0xFF);
+            pkt[7] = (byte) (bh & 0xFF);
+            int idx = 8;
+            for (int dy = 0; dy < bh; dy++) {
+                int sy = (dy * h) / bh;
+                int rowOff = sy * w;
+                for (int dx = 0; dx < bw; dx++) {
+                    int sx = (dx * w) / bw;
+                    int px = argb[rowOff + sx];
+                    pkt[idx++] = (byte) ((px >> 16) & 0xFF);
+                    pkt[idx++] = (byte) ((px >> 8) & 0xFF);
+                    pkt[idx++] = (byte) (px & 0xFF);
+                }
+            }
+            latestBridgePacket = pkt;
+            if (bridgeUdpSocket != null) {
+                DatagramPacket dp = new DatagramPacket(
+                        pkt,
+                        pkt.length,
+                        InetAddress.getByName("127.0.0.1"),
+                        TERMUX_BRIDGE_UDP_PORT
+                );
+                bridgeUdpSocket.send(dp);
+            }
+        } catch (Throwable ignored) {
         }
     }
 
@@ -441,7 +649,6 @@ public class ScreenCaptureManager {
             Canvas canvas = new Canvas(bmp);
             Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
 
-            // Render dynamic LED border preview around the canvas if LED colors are available
             p.setShader(new LinearGradient(0, 0, w, h,
                     new int[]{Color.rgb(18, 26, 42), Color.rgb(30, 48, 72)},
                     null, Shader.TileMode.CLAMP));
@@ -480,13 +687,13 @@ public class ScreenCaptureManager {
             p.setColor(Color.rgb(180, 220, 255));
             canvas.drawText(isCapturing()
                     ? ("Live Capture Active (" + activeCaptureMode + ")")
-                    : "Click 'Start TV Capture' in App Toolbar", w / 2f, h / 2f + 16f, p);
+                    : "Click 'Start MediaProjection' to Grant Screen Capture", w / 2f, h / 2f + 16f, p);
 
             ByteArrayOutputStream baos = new ByteArrayOutputStream(8192);
             bmp.compress(Bitmap.CompressFormat.JPEG, 75, baos);
             bmp.recycle();
             return baos.toByteArray();
-        } catch (Exception e) {
+        } catch (Throwable e) {
             return null;
         }
     }

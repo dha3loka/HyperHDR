@@ -1,0 +1,15 @@
+package android.content;
+import android.content.res.*;
+import java.io.File;
+public abstract class Context {
+    public static final String ACTIVITY_SERVICE = "activity";
+    public static final String MEDIA_PROJECTION_SERVICE = "media_projection";
+    public static final String NOTIFICATION_SERVICE = "notification";
+    public Context getApplicationContext() { return this; }
+    public AssetManager getAssets() { return null; }
+    public Resources getResources() { return null; }
+    public File getFilesDir() { return null; }
+    public Object getSystemService(String name) { return null; }
+    public ComponentName startService(Intent service) { return null; }
+    public ComponentName startForegroundService(Intent service) { return null; }
+}

@@ -1,0 +1,352 @@
+package org.hyperhdr.androidtv;
+
+import android.annotation.SuppressLint;
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.Context;
+import android.content.Intent;
+import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
+import android.media.projection.MediaProjectionManager;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.InputType;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.webkit.WebChromeClient;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.util.Locale;
+
+public class MainActivity extends Activity {
+
+    private static final int REQ_MEDIA_PROJECTION = 1001;
+
+    private TextView statusText;
+    private Button btnCaptureToggle;
+    private Button btnWledQuick;
+    private Button btnTestEffect;
+    private Button btnReloadWeb;
+    private WebView webView;
+
+    private final Handler uiHandler = new Handler(Looper.getMainLooper());
+    private int testModeStep = 0;
+    private boolean webLoaded = false;
+    private boolean autoCapturePrompted = false;
+
+    private final Runnable statusRefreshRunnable = new Runnable() {
+        @Override
+        public void run() {
+            updateStatusBar();
+            uiHandler.postDelayed(this, 1000);
+        }
+    };
+
+    @SuppressLint("SetJavaScriptEnabled")
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+
+        startHyperHdrService();
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.rgb(18, 22, 31));
+
+        // Top Android TV remote-friendly toolbar
+        LinearLayout topBar = new LinearLayout(this);
+        topBar.setOrientation(LinearLayout.HORIZONTAL);
+        topBar.setGravity(Gravity.CENTER_VERTICAL);
+        topBar.setPadding(dp(14), dp(8), dp(14), dp(8));
+        topBar.setBackgroundColor(Color.rgb(26, 32, 44));
+
+        statusText = new TextView(this);
+        statusText.setTextColor(Color.rgb(226, 232, 240));
+        statusText.setTextSize(13f);
+        statusText.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        LinearLayout.LayoutParams statusLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
+        topBar.addView(statusText, statusLp);
+
+        btnCaptureToggle = createTvButton("Start TV Capture", Color.rgb(16, 185, 129));
+        btnCaptureToggle.setOnClickListener(v -> onToggleScreenCapture());
+        topBar.addView(btnCaptureToggle, createBtnParams());
+
+        btnWledQuick = createTvButton("WLED IP / Scan", Color.rgb(59, 130, 246));
+        btnWledQuick.setOnClickListener(v -> showWledQuickDialog());
+        topBar.addView(btnWledQuick, createBtnParams());
+
+        btnTestEffect = createTvButton("Test LEDs", Color.rgb(139, 92, 246));
+        btnTestEffect.setOnClickListener(v -> onCycleTestEffect());
+        topBar.addView(btnTestEffect, createBtnParams());
+
+        btnReloadWeb = createTvButton("Reload UI (:8090)", Color.rgb(71, 85, 105));
+        btnReloadWeb.setOnClickListener(v -> {
+            if (webView != null) {
+                webView.loadUrl("http://127.0.0.1:8090/");
+            }
+        });
+        topBar.addView(btnReloadWeb, createBtnParams());
+
+        root.addView(topBar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // Full embedded HyperHDR v24.0.0-beta.0 Web UI (port 8090)
+        webView = new WebView(this);
+        WebSettings ws = webView.getSettings();
+        ws.setJavaScriptEnabled(true);
+        ws.setDomStorageEnabled(true);
+        ws.setDatabaseEnabled(true);
+        ws.setLoadWithOverviewMode(true);
+        ws.setUseWideViewPort(true);
+        ws.setBuiltInZoomControls(false);
+        ws.setDisplayZoomControls(false);
+        ws.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        webView.setBackgroundColor(Color.rgb(24, 28, 36));
+        webView.setWebChromeClient(new WebChromeClient());
+        webView.setWebViewClient(new WebViewClient());
+
+        root.addView(webView, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.0f));
+        setContentView(root);
+
+        btnCaptureToggle.requestFocus();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        uiHandler.post(statusRefreshRunnable);
+    }
+
+    @Override
+    protected void onPause() {
+        uiHandler.removeCallbacks(statusRefreshRunnable);
+        super.onPause();
+    }
+
+    private void startHyperHdrService() {
+        Intent svc = new Intent(this, HyperHdrService.class);
+        svc.setAction(HyperHdrService.ACTION_START_SERVER);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(svc);
+        } else {
+            startService(svc);
+        }
+    }
+
+    private void updateStatusBar() {
+        String ip = WledDriver.getLocalIpv4Address();
+        HyperHdrService svc = HyperHdrService.getInstance();
+        if (svc == null) {
+            statusText.setText("Starting HyperHDR v24.0.0-beta.0 Server on " + ip + ":8090 ...");
+            return;
+        }
+        if (!webLoaded && webView != null) {
+            webLoaded = true;
+            webView.loadUrl("http://127.0.0.1:" + svc.getServer().getHttpPort() + "/");
+        }
+        boolean capturing = svc.getScreenCaptureManager().isCapturing();
+        if (!capturing && !autoCapturePrompted) {
+            autoCapturePrompted = true;
+            uiHandler.postDelayed(() -> {
+                HyperHdrService s = HyperHdrService.getInstance();
+                if (s != null && !s.getScreenCaptureManager().isCapturing()) {
+                    requestMediaProjectionConsent();
+                }
+            }, 600);
+        }
+        String wledHost = svc.getWledDriver().getHost();
+        double fps = svc.getWledDriver().getCurrentLedFps();
+        int leds = svc.getColorEngine().getLedCount();
+        int port = svc.getServer().getHttpPort();
+        String mode = svc.getScreenCaptureManager().getActiveCaptureMode();
+
+        statusText.setText(String.format(Locale.US,
+                "HyperHDR v24.0.0-beta.0  •  Web UI: http://%s:%d  •  Capture: %s  •  WLED: %s (%d LEDs @ %.0f fps)",
+                ip, port, capturing ? ("ACTIVE (" + mode + ")") : "IDLE", wledHost, leds, fps));
+
+        if (capturing) {
+            btnCaptureToggle.setText("Stop TV Capture");
+            styleButton(btnCaptureToggle, Color.rgb(220, 38, 38), btnCaptureToggle.hasFocus());
+        } else {
+            btnCaptureToggle.setText("Start TV Capture");
+            styleButton(btnCaptureToggle, Color.rgb(16, 185, 129), btnCaptureToggle.hasFocus());
+        }
+    }
+
+    private void requestMediaProjectionConsent() {
+        try {
+            MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+            if (mpm != null) {
+                startActivityForResult(mpm.createScreenCaptureIntent(), REQ_MEDIA_PROJECTION);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void onToggleScreenCapture() {
+        HyperHdrService svc = HyperHdrService.getInstance();
+        if (svc != null && svc.getScreenCaptureManager().isCapturing()) {
+            Intent stopIntent = new Intent(this, HyperHdrService.class);
+            stopIntent.setAction(HyperHdrService.ACTION_STOP_CAPTURE);
+            startService(stopIntent);
+            Toast.makeText(this, "Stopped TV screen capture", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        requestMediaProjectionConsent();
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_MEDIA_PROJECTION) {
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                Intent capIntent = new Intent(this, HyperHdrService.class);
+                capIntent.setAction(HyperHdrService.ACTION_START_CAPTURE);
+                capIntent.putExtra(HyperHdrService.EXTRA_RESULT_CODE, resultCode);
+                capIntent.putExtra(HyperHdrService.EXTRA_RESULT_DATA, data);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(capIntent);
+                } else {
+                    startService(capIntent);
+                }
+                Toast.makeText(this, "HyperHDR v24.0.0-beta.0 Screen Capture Active! Works in background across TV apps.", Toast.LENGTH_LONG).show();
+            } else {
+                Toast.makeText(this, "Screen capture permission was not granted", Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    private void showWledQuickDialog() {
+        HyperHdrService svc = HyperHdrService.getInstance();
+        if (svc == null) return;
+
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(dp(20), dp(14), dp(20), dp(8));
+
+        TextView label = new TextView(this);
+        label.setText("Enter WLED IP address or hostname (or tap 'Scan LAN' to auto-discover WLED controllers):");
+        label.setTextSize(14f);
+        layout.addView(label);
+
+        final EditText input = new EditText(this);
+        input.setInputType(InputType.TYPE_CLASS_TEXT);
+        input.setText(svc.getWledDriver().getHost());
+        input.setSelection(input.getText().length());
+        layout.addView(input);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Configure WLED Controller")
+                .setView(layout)
+                .setPositiveButton("Save & Connect", (d, which) -> {
+                    String newIp = input.getText().toString().trim();
+                    if (!newIp.isEmpty()) {
+                        svc.updateWledHostQuick(newIp);
+                        svc.getWledDriver().identifyDevice(newIp);
+                        Toast.makeText(MainActivity.this, "Saved WLED host: " + newIp, Toast.LENGTH_SHORT).show();
+                        updateStatusBar();
+                    }
+                })
+                .setNeutralButton("Scan LAN for WLED", (d, which) -> scanLanForWled(svc))
+                .setNegativeButton("Cancel", null)
+                .create();
+        dialog.show();
+    }
+
+    private void scanLanForWled(HyperHdrService svc) {
+        Toast.makeText(this, "Scanning local network for WLED controllers...", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            JSONArray found = svc.getWledDriver().discoverDevices();
+            uiHandler.post(() -> {
+                if (found.length() == 0) {
+                    Toast.makeText(MainActivity.this, "No WLED controllers found on subnet", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                final String[] labels = new String[found.length()];
+                final String[] ips = new String[found.length()];
+                for (int i = 0; i < found.length(); i++) {
+                    JSONObject o = found.optJSONObject(i);
+                    labels[i] = o != null ? o.optString("name", "WLED") : "WLED";
+                    ips[i] = o != null ? o.optString("value", "") : "";
+                }
+                new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("Select Discovered WLED Controller")
+                        .setItems(labels, (d, idx) -> {
+                            svc.updateWledHostQuick(ips[idx]);
+                            svc.getWledDriver().identifyDevice(ips[idx]);
+                            Toast.makeText(MainActivity.this, "Connected to " + labels[idx], Toast.LENGTH_SHORT).show();
+                            updateStatusBar();
+                        })
+                        .show();
+            });
+        }).start();
+    }
+
+    private void onCycleTestEffect() {
+        HyperHdrService svc = HyperHdrService.getInstance();
+        if (svc == null) return;
+        testModeStep = (testModeStep + 1) % 3;
+        if (testModeStep == 1) {
+            svc.getColorEngine().setEffectPriority(1, "Rainbow swirl fast", -1, "TV Remote");
+            Toast.makeText(this, "Test Effect: Rainbow Swirl Fast", Toast.LENGTH_SHORT).show();
+        } else if (testModeStep == 2) {
+            svc.getColorEngine().setColorPriority(1, new int[]{255, 160, 60}, -1, "TV Remote");
+            Toast.makeText(this, "Test Color: Warm Bias Light", Toast.LENGTH_SHORT).show();
+        } else {
+            svc.getColorEngine().clearAllPriorities();
+            Toast.makeText(this, "Cleared override — Live TV Screen Capture active", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private Button createTvButton(String text, final int baseColor) {
+        final Button b = new Button(this);
+        b.setText(text);
+        b.setTextColor(Color.WHITE);
+        b.setTextSize(12f);
+        b.setAllCaps(false);
+        b.setFocusable(true);
+        b.setFocusableInTouchMode(false);
+        b.setPadding(dp(12), dp(6), dp(12), dp(6));
+        styleButton(b, baseColor, false);
+        b.setOnFocusChangeListener((v, hasFocus) -> styleButton(b, baseColor, hasFocus));
+        return b;
+    }
+
+    private void styleButton(Button b, int baseColor, boolean focused) {
+        GradientDrawable gd = new GradientDrawable();
+        gd.setCornerRadius(dp(6));
+        gd.setColor(baseColor);
+        if (focused) {
+            gd.setStroke(dp(3), Color.rgb(250, 204, 21));
+        } else {
+            gd.setStroke(dp(1), Color.argb(80, 255, 255, 255));
+        }
+        b.setBackground(gd);
+    }
+
+    private LinearLayout.LayoutParams createBtnParams() {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        lp.leftMargin = dp(8);
+        return lp;
+    }
+
+    private int dp(int v) {
+        return Math.round(v * getResources().getDisplayMetrics().density);
+    }
+}
